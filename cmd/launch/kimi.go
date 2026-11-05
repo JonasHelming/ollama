@@ -7,9 +7,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
+	"github.com/pelletier/go-toml/v2"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 	"github.com/ollama/ollama/envconfig"
+	modelpkg "github.com/ollama/ollama/types/model"
 )
 
 // Kimi implements Runner for Kimi Code CLI integration.
@@ -18,6 +23,8 @@ type Kimi struct{}
 const (
 	kimiDefaultModelAlias     = "ollama"
 	kimiDefaultMaxContextSize = 32768
+	kimiCodeProviderName      = "ollama"
+	kimiLegacyVersionPrefix   = "kimi, version "
 )
 
 var kimiGOOS = runtime.GOOS
@@ -30,7 +37,7 @@ func (k *Kimi) args(config string, extra []string) []string {
 	return args
 }
 
-func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
+func (k *Kimi) Run(model string, models []LaunchModel, args []string) error {
 	if strings.TrimSpace(model) == "" {
 		return fmt.Errorf("model is required")
 	}
@@ -38,29 +45,302 @@ func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
 		return err
 	}
 
-	config, err := buildKimiInlineConfig(model, resolveKimiMaxContextSize(model))
-	if err != nil {
-		return fmt.Errorf("failed to build kimi config: %w", err)
-	}
-
 	bin, err := ensureKimiInstalled()
 	if err != nil {
 		return err
 	}
 
-	cmd := exec.Command(bin, k.args(config, args)...)
+	var cmdArgs []string
+	if _, legacy := kimiLegacyCLIVersion(bin); legacy {
+		config, err := buildKimiInlineConfig(model, resolveKimiMaxContextSize(model))
+		if err != nil {
+			return fmt.Errorf("failed to build kimi config: %w", err)
+		}
+		cmdArgs = k.args(config, args)
+	} else {
+		if err := writeKimiCodeConfig(model, models); err != nil {
+			return fmt.Errorf("failed to configure kimi: %w", err)
+		}
+		cmdArgs = append([]string{"-m", kimiCodeModelAlias(model)}, args...)
+	}
+
+	cmd := exec.Command(bin, cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
+func kimiLegacyCLIVersion(bin string) (string, bool) {
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		return "", false
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	version, ok := strings.CutPrefix(strings.TrimSpace(line), kimiLegacyVersionPrefix)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(version), true
+}
+
+func kimiCodeModelAlias(model string) string {
+	return kimiCodeProviderName + "/" + model
+}
+
+func kimiCodeConfigPath() (string, error) {
+	if home := strings.TrimSpace(os.Getenv("KIMI_CODE_HOME")); home != "" {
+		return filepath.Join(home, "config.toml"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".kimi-code", "config.toml"), nil
+}
+
+func writeKimiCodeConfig(primary string, models []LaunchModel) error {
+	path, err := kimiCodeConfigPath()
+	if err != nil {
+		return err
+	}
+
+	cfg := map[string]any{}
+	exists := false
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		exists = true
+		if err := toml.Unmarshal(data, &cfg); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	case !os.IsNotExist(err):
+		return err
+	}
+
+	models = codexCatalogModels(primary, models)
+	aliases := make(map[string]bool, len(models))
+	for _, m := range models {
+		aliases[kimiCodeModelAlias(m.Name)] = true
+	}
+
+	modelsTable, _ := cfg["models"].(map[string]any)
+	defaultModel, _ := cfg["default_model"].(string)
+	nextDefault := defaultModel
+	if !kimiCodeDefaultSurvives(modelsTable, aliases, defaultModel) {
+		nextDefault = kimiCodeModelAlias(primary)
+	}
+
+	updated := kimiCodeRemoveOwnedSections(string(data), cfg, aliases)
+
+	provider, err := kimiCodeSectionText(fmt.Sprintf("[providers.%q]", kimiCodeProviderName), map[string]any{
+		"type":     "openai",
+		"base_url": envconfig.ConnectableHost().String() + "/v1",
+		"api_key":  "ollama",
+	})
+	if err != nil {
+		return err
+	}
+	sections := []string{provider}
+	for _, m := range models {
+		section, err := kimiCodeSectionText(fmt.Sprintf("[models.%q]", kimiCodeModelAlias(m.Name)), kimiCodeModelEntry(m))
+		if err != nil {
+			return err
+		}
+		sections = append(sections, section)
+	}
+	updated = kimiCodeAppendSections(updated, sections)
+	updated = codexSetRootStringValue(updated, "default_model", nextDefault)
+
+	if exists {
+		if updated == string(data) {
+			return nil
+		}
+		if kimiCodeHasUserContent(cfg) {
+			ok, err := ConfirmPrompt(fmt.Sprintf("Kimi Code config %s already has settings. Update it for Ollama now? (your settings are kept and a backup is saved)", path))
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("kimi config %s was not updated; re-run with --yes to update it", path)
+			}
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return fileutil.WriteWithBackup(path, []byte(updated), "kimi")
+}
+
+func kimiCodeDefaultSurvives(modelsTable map[string]any, aliases map[string]bool, alias string) bool {
+	if alias == "" {
+		return false
+	}
+	if aliases[alias] {
+		return true
+	}
+	entry, ok := modelsTable[alias]
+	return ok && !kimiCodeOwnedModel(entry)
+}
+
+func kimiCodeRemoveOwnedSections(text string, cfg map[string]any, aliases map[string]bool) string {
+	modelsTable, _ := cfg["models"].(map[string]any)
+	var headers []string
+	for _, line := range strings.SplitAfter(text, "\n") {
+		header := strings.TrimSpace(line)
+		path, ok := codexTableHeaderPath(header)
+		if !ok || len(path) < 2 {
+			continue
+		}
+		switch path[0] {
+		case "providers":
+			if len(path) == 2 && path[1] == kimiCodeProviderName {
+				headers = append(headers, header)
+			}
+		case "models":
+			alias := path[1]
+			if !aliases[alias] && !kimiCodeOwnedModel(modelsTable[alias]) {
+				continue
+			}
+			if len(path) > 2 && aliases[alias] {
+				continue
+			}
+			headers = append(headers, header)
+		}
+	}
+	for _, header := range headers {
+		text = codexRemoveSection(text, header)
+	}
+	return text
+}
+
+func kimiCodeSectionText(header string, values map[string]any) (string, error) {
+	body, err := toml.Marshal(values)
+	if err != nil {
+		return "", err
+	}
+	return header + "\n" + string(body), nil
+}
+
+func kimiCodeAppendSections(text string, sections []string) string {
+	out := text
+	for _, section := range sections {
+		if out != "" {
+			if !strings.HasSuffix(out, "\n") {
+				out += "\n"
+			}
+			if !strings.HasSuffix(out, "\n\n") {
+				out += "\n"
+			}
+		}
+		out += strings.TrimRight(section, "\n") + "\n"
+	}
+	return out
+}
+
+func kimiCodeOwnedModel(entry any) bool {
+	table, ok := entry.(map[string]any)
+	return ok && table["provider"] == kimiCodeProviderName
+}
+
+func kimiCodeHasUserContent(cfg map[string]any) bool {
+	for key, value := range cfg {
+		switch key {
+		case "providers":
+			table, ok := value.(map[string]any)
+			if !ok {
+				return true
+			}
+			for name := range table {
+				if name != kimiCodeProviderName {
+					return true
+				}
+			}
+		case "models":
+			table, ok := value.(map[string]any)
+			if !ok {
+				return true
+			}
+			for _, entry := range table {
+				if !kimiCodeOwnedModel(entry) {
+					return true
+				}
+			}
+		case "default_model":
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func kimiCodeModelEntry(m LaunchModel) map[string]any {
+	if m.Thinking == nil && m.HasCapability(modelpkg.CapabilityThinking) {
+		if meta, ok := lookupServerModelMetadata(m.Name); ok {
+			m.Thinking = meta.Thinking.Clone()
+		}
+	}
+	maxContextSize := m.ContextLength
+	if maxContextSize <= 0 {
+		maxContextSize = resolveKimiMaxContextSize(m.Name)
+	}
+	entry := map[string]any{
+		"provider":         kimiCodeProviderName,
+		"model":            m.Name,
+		"max_context_size": int64(maxContextSize),
+	}
+
+	capabilities := []string{}
+	if m.ToolCapable || m.HasCapability(modelpkg.CapabilityTools) {
+		capabilities = append(capabilities, "tool_use")
+	}
+	if m.HasCapability(modelpkg.CapabilityVision) {
+		capabilities = append(capabilities, "image_in")
+	}
+
+	levels, defaultLevel := launchReasoningEffortLevels(m.Thinking)
+	efforts := slices.DeleteFunc(slices.Clone(levels), func(level string) bool { return level == "none" })
+	if len(efforts) > 0 || m.HasCapability(modelpkg.CapabilityThinking) {
+		capabilities = append(capabilities, "thinking")
+		if slices.Contains(levels, "none") {
+			entry["off_effort"] = "none"
+		} else if len(efforts) > 0 {
+			capabilities = append(capabilities, "always_thinking")
+		}
+		if len(efforts) > 0 {
+			entry["support_efforts"] = kimiCodeStringList(efforts)
+			if slices.Contains(efforts, defaultLevel) {
+				entry["default_effort"] = defaultLevel
+			}
+		}
+	}
+	entry["capabilities"] = kimiCodeStringList(capabilities)
+	return entry
+}
+
+func kimiCodeStringList(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
+}
+
 func findKimiBinary() (string, error) {
+	home, _ := os.UserHomeDir()
+
+	kimiCodeBin := filepath.Join(home, ".kimi-code", "bin", "kimi")
+	if kimiGOOS == "windows" {
+		kimiCodeBin += ".exe"
+	}
+	if info, err := os.Stat(kimiCodeBin); err == nil && !info.IsDir() {
+		return kimiCodeBin, nil
+	}
+
 	if path, err := exec.LookPath("kimi"); err == nil {
 		return path, nil
 	}
-
-	home, _ := os.UserHomeDir()
 
 	var candidates []string
 	switch kimiGOOS {
